@@ -1,0 +1,344 @@
+import asyncio
+import json
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query
+from fastapi.responses import StreamingResponse
+from backend.models import (AssembleRequest, CandidateRequest, DraftRequest, HybridRequest, MemoryPatch, MessageCreate,
+                            ProgressReport, RunCreate, SessionCreate, ValidationRequest)
+from backend.planning import Chooser, assemble_option, budget_repair, plan_desktop, plan_laptops
+from backend.attributes import filters_for
+from backend.requirement_rules import inapplicable, unsupported_requests
+from backend.requirements_parser import parse_requirements
+from backend.validation import validate_option
+
+
+NOTHING_CHANGED = (
+    "I could not turn that message into a requirement, so nothing changed and a new recommendation would be the "
+    "same. I can act on: desktop or laptop, budget, what you will use it for, minimum memory, storage or graphics "
+    "memory (for example \"a graphics card with at least 12GB\"), the maker of the processor, graphics card or "
+    "another part, preferences such as quiet or white, parts to keep, and parts you already own.")
+
+
+def create_router(store, corpus, engine):
+    router = APIRouter(prefix="/api/v1", tags=["recommendation"])
+
+    def owned_session(session_id: str, owner_id: str):
+        item = store.session(session_id)
+        if not item or item.get("owner_id") != owner_id:
+            raise HTTPException(404, "Session not found")
+        return item
+
+    def require_internal(token: str | None):
+        configured = engine.settings.internal_api_token
+        if configured and token != configured:
+            raise HTTPException(403, "Invalid internal service token")
+
+    def offer_view(row: dict) -> dict:
+        return {"offer_id": row["id"], "product_id": str(row.get("product_id") or row["id"]), "category": row["category"],
+                "name": row["name"], "price_sgd": float(row["price"]), "merchant": row.get("store"),
+                "specs": {k: v for k, v in row.get("specs", {}).items() if v is not None}}
+
+    known_spec_keys: dict[str, set[str]] = {}
+
+    def spec_keys() -> dict[str, set[str]]:
+        """Specification names that at least one offer of each category carries in the pinned snapshot."""
+        if not known_spec_keys:
+            for row in corpus.prices:
+                keys = known_spec_keys.setdefault(row["category"], set())
+                keys.update(k for k, v in corpus.specs.get(row["id"], {}).items() if v is not None)
+        return known_spec_keys
+
+    def owned_run(run_id: str, owner_id: str):
+        if store.run_owner(run_id) != owner_id:
+            raise HTTPException(404, "Run not found")
+        return store.run(run_id)
+
+    def owned_memory(memory_id: str, owner_id: str):
+        memory = store.memory(memory_id)
+        if not memory:
+            raise HTTPException(404, "Memory not found")
+        owned_session(memory["session_id"], owner_id)
+        return memory
+
+    @router.post("/sessions", status_code=201)
+    def create_session(body: SessionCreate, x_user_id: str = Header("dev-user")):
+        return store.create_session(body.model_dump(), x_user_id)
+
+    @router.get("/sessions/{session_id}")
+    def get_session(session_id: str, x_user_id: str = Header("dev-user")):
+        item = owned_session(session_id, x_user_id)
+        item["memories"] = store.list_memories(session_id)
+        return item
+
+    @router.post("/sessions/{session_id}/messages")
+    def add_message(session_id: str, body: MessageCreate, x_user_id: str = Header("dev-user")):
+        session = owned_session(session_id, x_user_id)
+        if session["requirements_version"] != body.expected_requirements_version:
+            raise HTTPException(409, detail={"code": "REQUIREMENTS_VERSION_CONFLICT", "current_version": session["requirements_version"]})
+        mid = store.add_message(session_id, body.client_message_id, body.text)
+        previous = store.latest_completed_run(session_id)
+        recent_items = [{"name": i["name"], "product_id": i["product_id"], "category": i["category"]}
+                        for o in ((previous or {}).get("result") or {}).get("options", []) for i in o["items"]
+                        if not i.get("owned_by_user")]
+        requirements, questions = parse_requirements(body.text, session["requirements"], engine.model, corpus, recent_items)
+        status = "needs_clarification" if questions else "ready"
+        try:
+            version = store.update_requirements(session_id, body.expected_requirements_version, requirements, status)
+        except ValueError as exc:
+            raise HTTPException(409, detail={"code": "REQUIREMENTS_VERSION_CONFLICT", "current_version": exc.args[0]})
+        # A message that changes nothing must not be answered with "Understood": the next recommendation
+        # would be identical, and the user should know why and what the system can act on.
+        def stated(req: dict) -> dict:
+            return {k: v for k, v in req.items() if k != "understanding_source" and v not in (None, [], {})}
+
+        changed = stated(requirements) != stated(session["requirements"])
+        # Wishes the recommendation cannot honour are named, so they are not mistaken for understood.
+        notes = unsupported_requests(body.text, requirements.get("device_type")) + inapplicable(body.text, requirements)
+        if changed or questions:
+            assistant_message, generation_source = engine.intake_reply(body.text, requirements, questions, notes)
+        else:
+            assistant_message, generation_source = NOTHING_CHANGED, "fallback"
+        if notes:
+            assistant_message += (" Note: I cannot act on " + ", ".join(notes) + "; that is outside what I plan or what "
+                                  "the catalogue records, so the recommendation will not reflect it.")
+        store.add_reply(session_id, assistant_message)
+        reply_options = questions[0].get("options", []) if questions else []
+        return {"session_id": session_id, "message_id": mid, "requirements_version": version,
+                "status": status, "requirements": requirements, "questions": questions,
+                "can_generate": not questions, "requirements_changed": changed, "not_acted_on": notes,
+                "assistant_message": assistant_message,
+                "generation_source": generation_source, "reply_options": reply_options}
+
+    @router.get("/sessions/{session_id}/transcript")
+    def transcript(session_id: str, x_user_id: str = Header("dev-user")):
+        """Everything a reloaded page needs to continue: the conversation so far, the open question, the last
+        result to show and a run that is still in progress."""
+        session = owned_session(session_id, x_user_id)
+        entries = store.messages(session_id)
+        runs = store.session_runs(session_id)
+        for run in runs:
+            if run["status"] == "completed" and (run["result"] or {}).get("assistant_message"):
+                entries.append({"role": "assistant", "text": run["result"]["assistant_message"], "created_at": run["updated_at"],
+                                "run_id": run["id"]})
+        entries.sort(key=lambda entry: entry["created_at"])
+        questions = parse_requirements("", session["requirements"], catalogue=corpus)[1] if session["requirements"] else []
+        ready = bool(session["requirements"]) and not questions
+        completed = [run for run in runs if run["status"] == "completed"]
+        active = next((run for run in reversed(runs) if run["status"] in ("queued", "running")), None)
+        return {"session_id": session_id, "requirements_version": session["requirements_version"], "messages": entries,
+                "can_generate": ready, "reply_options": questions[0].get("options", []) if questions else [],
+                "latest_run": {"id": completed[-1]["id"], "requirements_version": completed[-1]["requirements_version"]} if completed else None,
+                "active_run": {"id": active["id"], "stage": active["stage"], "orchestration_mode": active["orchestration_mode"],
+                               "created_at": active["created_at"]} if active else None}
+
+    @router.post("/sessions/{session_id}/runs", status_code=202)
+    def create_run(session_id: str, body: RunCreate, background: BackgroundTasks,
+                   idempotency_key: str | None = Header(None), x_user_id: str = Header("dev-user")):
+        session = owned_session(session_id, x_user_id)
+        req = store.requirements(session_id, body.requirements_version)
+        if not req:
+            raise HTTPException(409, detail={"code": "REQUIREMENTS_VERSION_NOT_FOUND"})
+        _, questions = parse_requirements("", req, catalogue=corpus)
+        if questions:
+            raise HTTPException(409, detail={"code": "REQUIREMENTS_INCOMPLETE", "questions": questions})
+        if body.base_run_id:
+            base = store.run(body.base_run_id)
+            if not base or base["session_id"] != session_id or base["status"] != "completed":
+                raise HTTPException(409, detail={"code": "BASE_RUN_UNUSABLE",
+                                                 "message": "base_run_id must be a completed run of this session"})
+        # One run per session at a time: a second click, tab or reload joins the run already in progress
+        # instead of starting another that competes for the same local model.
+        in_progress = store.active_run(session_id)
+        run = in_progress or store.create_run(session_id, body.requirements_version, corpus.snapshot_id,
+                                              body.orchestration_mode, idempotency_key, body.base_run_id)
+        if not in_progress and run["status"] == "queued":
+            background.add_task(engine.execute, run["id"], body.maximum_options)
+        return {**run, "status_url": f"/api/v1/runs/{run['id']}", "events_url": f"/api/v1/runs/{run['id']}/events",
+                "result_url": f"/api/v1/runs/{run['id']}/result", "idempotency_key": idempotency_key}
+
+    @router.get("/runs/{run_id}")
+    def get_run(run_id: str, x_user_id: str = Header("dev-user")):
+        run = owned_run(run_id, x_user_id)
+        return run
+
+    @router.get("/runs/{run_id}/result")
+    def get_result(run_id: str, x_user_id: str = Header("dev-user")):
+        run = owned_run(run_id, x_user_id)
+        if run["status"] not in ("completed", "failed", "cancelled"):
+            raise HTTPException(409, detail={"code": "RESULT_NOT_READY", "status": run["status"]})
+        return run["result"] if run["status"] == "completed" else {"status": run["status"], "error": run["error"]}
+
+    @router.get("/runs/{run_id}/execution")
+    def inspect_execution(run_id: str, x_user_id: str = Header("dev-user")):
+        run = owned_run(run_id, x_user_id)
+        return {"run": run, "operation_state": store.operation_state(run_id),
+                "tool_calls": store.tool_calls(run_id), "usage_ledger": store.usage_rows(run_id)}
+
+    @router.get("/runs/{run_id}/events")
+    async def run_events(run_id: str, after: int = Query(0, ge=0), x_user_id: str = Header("dev-user")):
+        owned_run(run_id, x_user_id)
+        async def stream():
+            cursor = after
+            while True:
+                events = store.events(run_id, cursor)
+                for event in events:
+                    cursor = event["seq"]
+                    yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+                current = store.run(run_id)
+                if current["status"] in ("completed", "failed", "cancelled") and not events:
+                    break
+                await asyncio.sleep(.25)
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    @router.post("/runs/{run_id}/cancel", status_code=202)
+    def cancel_run(run_id: str, x_user_id: str = Header("dev-user")):
+        run = owned_run(run_id, x_user_id)
+        if run["status"] in ("completed", "failed", "cancelled"):
+            return run
+        store.set_run(run_id, "cancelled", "cancelled")
+        store.event(run_id, "cancelled", {"stage": "cancelled"})
+        return store.run(run_id)
+
+    @router.get("/sessions/{session_id}/memories")
+    def memories(session_id: str, x_user_id: str = Header("dev-user")):
+        owned_session(session_id, x_user_id)
+        return {"items": store.owner_memories(x_user_id)}
+
+    @router.post("/sessions/{session_id}/memories", status_code=201)
+    def add_memory(session_id: str, kind: str, value: str = Query(..., min_length=1, max_length=300), confirmed: bool = False,
+                   x_user_id: str = Header("dev-user")):
+        session = owned_session(session_id, x_user_id)
+        if not session["long_term_memory"]:
+            raise HTTPException(409, detail={"code": "LONG_TERM_MEMORY_DISABLED"})
+        same = next((m for m in store.owner_memories(x_user_id)
+                     if m["kind"] == kind and str(m["value"]).strip().casefold() == value.strip().casefold()), None)
+        return same or store.add_memory(session_id, kind, value.strip(), confirmed, None)      # saving it twice keeps one
+
+    @router.patch("/memories/{memory_id}")
+    def patch_memory(memory_id: str, body: MemoryPatch, x_user_id: str = Header("dev-user")):
+        owned_memory(memory_id, x_user_id)
+        try:
+            return store.patch_memory(memory_id, body.expected_version, body.value, body.confirmed)
+        except KeyError:
+            raise HTTPException(404, "Memory not found")
+        except ValueError as exc:
+            raise HTTPException(409, detail={"code": "MEMORY_VERSION_CONFLICT", "current_version": exc.args[0]})
+
+    @router.delete("/memories/{memory_id}", status_code=204)
+    def delete_memory(memory_id: str, x_user_id: str = Header("dev-user")):
+        owned_memory(memory_id, x_user_id)
+        if not store.delete_memory(memory_id):
+            raise HTTPException(404, "Memory not found")
+
+    @router.post("/internal/runs/{run_id}/progress", status_code=204)
+    def report_progress(run_id: str, body: ProgressReport, x_internal_token: str | None = Header(None)):
+        """Lets the Pi runtime show what it is doing while the API waits for its result."""
+        require_internal(x_internal_token)
+        if store.set_stage(run_id, body.stage):
+            store.event(run_id, "progress", {"stage": body.stage, "message": body.message})
+
+    @router.post("/internal/retrieval/hybrid")
+    def hybrid(body: HybridRequest, x_internal_token: str | None = Header(None)):
+        require_internal(x_internal_token)
+        return corpus.search(body.query, body.categories, body.product_ids, body.top_k)
+
+    @router.get("/internal/candidates/{category}")
+    def internal_candidates(category: str, maximum_minor: int | None = None,
+                            limit: int = Query(25, ge=1, le=100),
+                            x_internal_token: str | None = Header(None)):
+        require_internal(x_internal_token)
+        return {"snapshot_id": corpus.snapshot_id,
+                "items": corpus.candidates(category, maximum_minor, limit)}
+
+    @router.post("/internal/candidates")
+    def internal_candidates_filtered(body: CandidateRequest, x_internal_token: str | None = Header(None)):
+        """Compatible in-stock offers for the Pi runtime's find_parts tool."""
+        require_internal(x_internal_token)
+        if body.product_ids:
+            return {"snapshot_id": corpus.snapshot_id, "items": [offer_view(r) for r in corpus.products(body.product_ids)]}
+        # A filter on a specification the category does not have matches nothing useful: offers with an
+        # unknown value are kept by design, so the caller would be handed parts that were never checked.
+        known = spec_keys().get(body.category)
+        if known is None:
+            return {"snapshot_id": corpus.snapshot_id, "items": [],
+                    "invalid_filters": {"unknown_category": body.category, "valid_categories": sorted(spec_keys())}}
+        unknown = sorted(k for k in {**body.require, **body.minimum_specs} if k not in known)
+        if unknown:
+            return {"snapshot_id": corpus.snapshot_id, "items": [],
+                    "invalid_filters": {"unknown_keys": unknown, "valid_keys": sorted(known)}}
+        # What the user asked for by maker, chip, store or feature applies to every search of this run,
+        # whether or not the runtime remembers to ask for it.
+        run = store.run(body.run_id)
+        stated = filters_for(body.category, store.requirements(run["session_id"], run["requirements_version"]) or {}) if run else {}
+        filters = (body.require or None, body.minimum_specs or None, body.exclude_ids)
+        rows = corpus.candidates(body.category, body.maximum_minor, body.limit, body.minimum_minor, *filters, body.order,
+                                 stated or None)
+        response = {"snapshot_id": corpus.snapshot_id, "items": [offer_view(r) for r in rows]}
+        if not rows and (body.maximum_minor is not None or body.minimum_minor is not None):
+            # Tell the caller where matching offers start, so it does not probe the price one dollar at a time.
+            cheapest = corpus.candidates(body.category, None, 1, None, *filters, "price_asc", stated or None)
+            response["cheapest_match_sgd"] = float(cheapest[0]["price"]) if cheapest else None
+        return response
+
+    @router.post("/internal/options/draft")
+    def draft(body: DraftRequest, x_internal_token: str | None = Header(None)):
+        """A deterministic first draft (compatibility chain, budget shares) for the Pi runtime to review and repair."""
+        require_internal(x_internal_token)
+        if body.device_type == "desktop":
+            option = plan_desktop(corpus.candidates, corpus.products, body.requirements, Chooser())
+        else:
+            options = plan_laptops(corpus.candidates, body.requirements, Chooser(), 1)
+            option = options[0] if options else {"items": []}
+        return {"items": [{"offer_id": i["offer_id"], "product_id": i["product_id"], "category": i["category"],
+                           "name": i["name"], "price_sgd": float(i["price"]), "locked": bool(i.get("locked")),
+                           "owned_by_user": bool(i.get("owned_by_user")),
+                           "specs": {k: v for k, v in (i.get("specs") or {}).items() if v is not None}}
+                          for i in option["items"]]}
+
+    @router.post("/internal/options/assemble")
+    def assemble(body: AssembleRequest, x_internal_token: str | None = Header(None)):
+        """Build an option from offer ids on the server and validate it, so the runtime never invents items."""
+        require_internal(x_internal_token)
+        try:
+            option = assemble_option(corpus, body.device_type, body.offer_ids, body.requirements)
+        except KeyError as exc:
+            raise HTTPException(422, detail={"code": "UNKNOWN_OFFER", "offer_ids": exc.args[0]})
+        validation = validate_option(option, body.requirements)
+        response = {"option": option, "validation": validation}
+        repair = budget_repair(option, validation, corpus.candidates, body.requirements, validate_option)
+        if repair:
+            for entry in repair["single_swaps"] + repair["partial_savings"]:
+                entry["alternatives"] = [offer_view(r) for r in entry["alternatives"]]
+            response["budget_repair"] = repair
+        return response
+
+    @router.post("/internal/options/validate")
+    def validate(body: ValidationRequest, x_internal_token: str | None = Header(None)):
+        require_internal(x_internal_token)
+        return validate_option(body.option, body.requirements)
+
+    @router.get("/health")
+    def health():
+        production = engine.settings.retrieval_backend == "neo4j_milvus"
+        store_status = corpus.status() if hasattr(corpus, "status") else None
+        published = bool(store_status) and store_status.get("manifest_status") == "published"
+        detail = None
+        if not production:
+            detail = "Local contract fallback is active; Neo4j and Milvus are not serving requests."
+        elif not published:
+            detail = "The pinned snapshot is not published in Neo4j/Milvus; run python -m backend.index_data."
+        return {"status": "ok" if production and published else "degraded",
+                "snapshot_id": corpus.snapshot_id,
+                "retrieval_backend": engine.settings.retrieval_backend,
+                "knowledge_base": store_status,
+                "recent_degradations": getattr(corpus, "events", [])[-5:],
+                "detail": detail,
+                "models": {
+                    "chat_provider": engine.settings.model_provider,
+                    "chat_model": engine.settings.model_name,
+                    "embedding_provider": engine.settings.embedding_provider,
+                    "embedding_model": engine.settings.embedding_model,
+                    "embedding_dimensions": engine.settings.embedding_dimensions,
+                },
+                "pi_runtime_configured": bool(engine.settings.pi_runtime_url)}
+
+    return router
