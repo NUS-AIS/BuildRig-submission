@@ -1,0 +1,15 @@
+<script setup>
+import { onMounted, ref } from 'vue'
+import { BrainCircuit, Plus, Trash2, ShieldCheck } from '@lucide/vue'
+import AppShell from '../components/AppShell.vue'
+import { api } from '../services/api'
+import { workspace } from '../state/workspace'
+const items=ref([]), value=ref(''), kind=ref('preference'), error=ref(''), busy=ref(false)
+// Memories belong to the person, but the API reaches them through a conversation; one is opened if there is none yet.
+async function session(){if(workspace.sessionId){try{await api.getSession(workspace.sessionId);return workspace.sessionId}catch{workspace.setSession(null,0)}}const created=await api.createSession();workspace.setSession(created.id,0);return created.id}
+async function load(){try{items.value=(await api.memories(await session())).items;error.value=''}catch{error.value='Saved memories could not be loaded. Check that the backend is running.'}}
+async function add(){const text=value.value.trim();if(!text||busy.value)return;busy.value=true;try{await api.addMemory(await session(),kind.value,text);value.value='';await load()}catch{error.value='That memory could not be saved. Check that the backend is running and try again.'}finally{busy.value=false}}
+async function remove(id){try{await api.deleteMemory(id);await load()}catch{error.value='That memory could not be removed.'}}
+onMounted(load)
+</script>
+<template><AppShell><div class="content-page narrow"><div class="page-heading"><div><span class="eyebrow">CONTROL YOUR CONTEXT</span><h1>Recommendation memory</h1><p>Only confirmed preferences are reused in future agent runs.</p></div></div><div class="memory-info"><ShieldCheck :size="22"/><div><strong>You stay in control</strong><p>Current request constraints always override saved preferences. Removing a memory prevents it from being used again.</p></div></div><form class="memory-form" @submit.prevent="add"><select v-model="kind"><option value="preference">Preference</option><option value="workload">Workload</option><option value="owned_device">Owned device</option></select><input v-model="value" maxlength="200" placeholder="e.g. Prefer quiet systems"/><button class="primary-button fit" :disabled="busy"><Plus :size="17"/>Add memory</button></form><p class="demo-note left">Preferences are applied to every new recommendation, in any conversation. A saved workload is used when a request does not name one. Owned devices are kept for your reference and are not yet applied.</p><p v-if="error" class="form-error">{{error}}</p><div v-if="items.length" class="memory-list"><article v-for="item in items" :key="item.id"><span class="memory-icon"><BrainCircuit :size="19"/></span><div><small>{{item.kind.replace('_',' ')}}</small><strong>{{item.value}}</strong><span>Confirmed · Version {{item.version}}</span></div><button @click="remove(item.id)" aria-label="Delete memory"><Trash2 :size="17"/></button></article></div><div v-else class="empty-state small"><BrainCircuit :size="40"/><h2>No saved preferences</h2><p>Add only details you want the advisor to reuse.</p></div></div></AppShell></template>
